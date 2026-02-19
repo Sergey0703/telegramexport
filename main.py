@@ -8,9 +8,9 @@ Downloads media, parses product metadata, and organizes into structured format.
 
 import argparse
 import asyncio
+import json
 import os
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -101,41 +101,19 @@ class TelegramScraper:
         name = name.replace(" ", "_")
         return name
 
-    async def download_media(self, message: Message, product_folder: Path) -> list:
-        """Download all media from a message to the product folder."""
+    async def download_media_list(self, messages: list, product_folder: Path) -> list:
+        """Download all media from a list of messages (single or album) to the product folder."""
         downloaded_files = []
 
-        if isinstance(message.media, MessageMediaPhoto):
-            # Single photo
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
+                continue
             file_path = await self.client.download_media(
-                message.media, file=str(product_folder / "img_1.jpg")
+                msg.media,
+                file=str(product_folder / f"img_{idx + 1}.jpg"),
             )
             if file_path:
                 downloaded_files.append(os.path.basename(file_path))
-
-        elif isinstance(message.media, MessageMediaDocument):
-            # Document (could be photo or file)
-            file_path = await self.client.download_media(
-                message.media, file=str(product_folder / "img_1.jpg")
-            )
-            if file_path:
-                downloaded_files.append(os.path.basename(file_path))
-
-        # Handle albums (multiple photos in one message)
-        if message.media and hasattr(message.media, "grouped_id") and message.media.grouped_id:
-            # Get all messages in the album
-            album_messages = await self.client.get_messages(
-                self.channel,
-                filter=lambda m: m.media and m.media.grouped_id == message.media.grouped_id,
-            )
-            for idx, album_msg in enumerate(album_messages):
-                if album_msg.media:
-                    file_path = await self.client.download_media(
-                        album_msg.media,
-                        file=str(product_folder / f"img_{idx + 1}.jpg"),
-                    )
-                    if file_path:
-                        downloaded_files.append(os.path.basename(file_path))
 
         return downloaded_files
 
@@ -151,30 +129,53 @@ class TelegramScraper:
         entity = await self.client.get_entity(self.channel)
         messages = await self.client.get_messages(entity, limit=limit)
 
+        # Group messages into products (albums share a grouped_id; singles stand alone).
+        # messages are ordered newest-first; preserve that order.
+        seen_group_ids = set()
+        groups: list[tuple[Message, list[Message]]] = []  # (lead_msg, all_msgs_in_group)
+
         for msg in messages:
-            if not msg.message:
+            if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 continue
 
-            # Check if message has media (photos)
-            has_media = isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument))
+            if msg.grouped_id:
+                if msg.grouped_id in seen_group_ids:
+                    # Already added as part of a group — append to it
+                    for lead, group in groups:
+                        if lead.grouped_id == msg.grouped_id:
+                            group.append(msg)
+                            break
+                else:
+                    seen_group_ids.add(msg.grouped_id)
+                    groups.append((msg, [msg]))
+            else:
+                groups.append((msg, [msg]))
 
-            if not has_media:
-                continue
-
-            product_info = self.parse_product_info(msg.message)
-
-            if product_info is None:
-                # Message has media but couldn't be parsed
+        # Filter to only groups where any message has parseable product text
+        valid_groups = []
+        for lead, group in groups:
+            # The text can be on any message in the album (usually the last one)
+            text = next((m.message for m in group if m.message), None)
+            if text and self.parse_product_info(text) is not None:
+                valid_groups.append((lead, group, text))
+            else:
                 self.unparsed_count += 1
-                continue
+
+        total = len(valid_groups)
+        print(f"  Found {total} product messages to download...")
+
+        for idx, (lead, group, text) in enumerate(valid_groups):
+            product_num = idx + 1  # 1 = newest post in Telegram
+            product_info = self.parse_product_info(text)
 
             # Create product folder
-            folder_name = f"{product_info['name']}_{product_info['price']}"
+            num_str = str(product_num).zfill(len(str(total)))
+            folder_name = f"{num_str}_{product_info['name']}_{product_info['price']}"
             product_folder = DOWNLOADS_DIR / folder_name
             product_folder.mkdir(parents=True, exist_ok=True)
 
-            # Download media
-            downloaded_files = await self.download_media(msg, product_folder)
+            # Download media — pass all messages in the album
+            downloaded_files = await self.download_media_list(group, product_folder)
 
             if not downloaded_files:
                 # No media downloaded, skip
@@ -187,12 +188,11 @@ class TelegramScraper:
                 "size": product_info["size"],
                 "description": product_info["description"],
                 "images": downloaded_files,
-                "message_date": msg.date.isoformat() if msg.date else None,
-                "message_id": msg.id,
+                "message_date": lead.date.isoformat() if lead.date else None,
+                "message_id": lead.id,
             }
 
             # Save metadata.json
-            import json
             with open(product_folder / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
 
