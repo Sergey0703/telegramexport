@@ -108,12 +108,20 @@ class TelegramScraper:
         for idx, msg in enumerate(messages):
             if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 continue
-            file_path = await self.client.download_media(
-                msg.media,
-                file=str(product_folder / f"img_{idx + 1}.jpg"),
-            )
-            if file_path:
-                downloaded_files.append(os.path.basename(file_path))
+            dest = str(product_folder / f"img_{idx + 1}.jpg")
+            for attempt in range(1, 4):  # up to 3 attempts
+                try:
+                    file_path = await self.client.download_media(msg.media, file=dest)
+                    if file_path:
+                        downloaded_files.append(os.path.basename(file_path))
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        print(f"    ⚠ Skipped img_{idx + 1} after 3 attempts: {e}")
+                    else:
+                        wait = attempt * 3
+                        print(f"    ↻ Retry {attempt}/3 for img_{idx + 1} in {wait}s...")
+                        await asyncio.sleep(wait)
 
         return downloaded_files
 
@@ -212,39 +220,74 @@ class TelegramScraper:
             print(f"  ✓ Downloaded: {folder_name} ({len(downloaded_files)} images)")
 
             # Rate limiting to avoid FloodWait
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
 
         print(f"\n📊 Summary:")
         print(f"  • Products downloaded: {len(self.products)}")
         print(f"  • Unparsed media messages: {self.unparsed_count}")
 
-    def generate_export(self, format: str = "csv"):
+    def generate_export(self, format: str = "csv", image_base_url: str = ""):
         """
-        Generate export file for web platform import.
+        Generate BigCommerce-compatible export file.
 
         Args:
             format: Export format ('csv' or 'xlsx')
+            image_base_url: Base URL prefix for images (e.g. https://cdn.example.com/).
+                            If empty, just the filename is used (for WebDAV imports).
         """
         if not self.products:
             print("\n⚠ No products to export.")
             return
 
-        df = pd.DataFrame(self.products)
+        # Find max number of images across all products
+        max_images = max(
+            len(p["images"].split(";")) for p in self.products
+        )
 
-        # Reorder columns for standard e-commerce import
-        columns_order = ["name", "price", "size", "description", "images", "folder"]
-        df = df[columns_order]
+        rows = []
+        for p in self.products:
+            image_files = p["images"].split(";")
+
+            # Convert price: UAH → EUR (divide by 50, round to nearest integer)
+            price_uah = p["price"]
+            price_eur = round(price_uah / 50)
+
+            row = {
+                "Item Type": "Product",
+                "Name": p["name"].replace("_", " "),
+                "Price": price_eur,
+                "Description": p["description"],
+                "Brand Name": "",
+                "Weight": 0.5,
+                "Type": "P",
+                "Is Visible": "Y",
+            }
+
+            # Add image columns: Product Image File – 1, 2, 3, ...
+            for i in range(max_images):
+                col = f"Product Image File – {i + 1}"
+                if i < len(image_files):
+                    fname = image_files[i]
+                    row[col] = f"{image_base_url.rstrip('/')}/{fname}" if image_base_url else fname
+                else:
+                    row[col] = ""
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if format == "xlsx":
-            export_path = DOWNLOADS_DIR / f"export_{timestamp}.xlsx"
+            export_path = DOWNLOADS_DIR / f"export_bigcommerce_{timestamp}.xlsx"
             df.to_excel(export_path, index=False, sheet_name="Products")
         else:
-            export_path = DOWNLOADS_DIR / f"export_{timestamp}.csv"
+            export_path = DOWNLOADS_DIR / f"export_bigcommerce_{timestamp}.csv"
             df.to_csv(export_path, index=False, encoding="utf-8-sig")
 
-        print(f"\n💾 Export saved: {export_path}")
+        print(f"\n💾 BigCommerce export saved: {export_path}")
+        print(f"   Products: {len(rows)}, Image columns: {max_images}")
+        print(f"   Price conversion: UAH ÷ 50 → EUR (rounded)")
 
 
 async def main():
@@ -267,6 +310,13 @@ async def main():
         choices=["csv", "xlsx"],
         default="csv",
         help="Export format (default: csv)"
+    )
+    parser.add_argument(
+        "--image-base-url",
+        type=str,
+        default="",
+        help="Base URL prefix for images in CSV (e.g. https://cdn.example.com/products). "
+             "Leave empty for WebDAV imports (filename only)."
     )
 
     args = parser.parse_args()
@@ -297,7 +347,7 @@ async def main():
     try:
         await scraper.start()
         await scraper.scrape_channel(limit=args.limit)
-        scraper.generate_export(format=args.export_format)
+        scraper.generate_export(format=args.export_format, image_base_url=args.image_base_url)
     except FloodWaitError as e:
         print(f"\n⚠ Rate limited. Please wait {e.seconds} seconds and try again.")
     except Exception as e:
